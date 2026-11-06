@@ -1,0 +1,5 @@
+FROM python:3.11-slim
+RUN apt-get update && apt-get install -y --no-install-recommends ffmpeg && rm -rf /var/lib/apt/lists/*
+RUN pip install --no-cache-dir fastapi "uvicorn[standard]" python-multipart
+WORKDIR /app
+COPY mock_asr_server.py mock_llm_server.py ./

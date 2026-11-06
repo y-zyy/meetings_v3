@@ -1,0 +1,104 @@
+# 개발용 오버라이드: backend 소스코드를 컨테이너에 바인드 마운트해서
+# 코드를 수정할 때마다 `docker compose build`를 다시 돌릴 필요가 없게 함.
+#
+# 사용법 (infra 디렉터리에서 실행 시 자동으로 docker-compose.yml과 병합됨):
+#   cd infra
+#   docker compose up -d --build   # 최초 1회 (watchdog 등 의존성 설치 위해 build 필요)
+#   docker compose up -d           # 이후에는 build 없이 그냥 up만 하면 됨
+#
+# 이후로는 backend/ 안의 .py 파일을 고치면:
+#   - api    : uvicorn --reload 가 감지해서 자동 재시작
+#   - worker-* : watchmedo가 감지해서 각 Celery worker 프로세스를 자동 재시작
+# 컨테이너를 다시 빌드하거나 재시작할 필요가 없음.
+# (requirements.txt 등 의존성을 바꿀 때만 --build 다시 필요)
+
+services:
+  api:
+    volumes:
+      - ../backend:/app
+    command: uvicorn app.main:app --host 0.0.0.0 --port 8000 --reload
+
+  worker-ingest:
+    volumes:
+      - ../backend:/app
+    command:
+      - /bin/sh
+      - -c
+      - >-
+        exec watchmedo auto-restart
+        --directory=./app
+        --pattern=*.py
+        --recursive
+        --
+        celery -A app.workers.celery_app worker
+        --loglevel=info
+        --concurrency="$${INGEST_WORKER_CONCURRENCY:-4}"
+        --queues=ingest
+
+  worker-asr:
+    volumes:
+      - ../backend:/app
+    command:
+      - /bin/sh
+      - -c
+      - >-
+        exec watchmedo auto-restart
+        --directory=./app
+        --pattern=*.py
+        --recursive
+        --
+        celery -A app.workers.celery_app worker
+        --loglevel=info
+        --concurrency="$${ASR_WORKER_CONCURRENCY:-2}"
+        --queues=asr
+
+  worker-diarize:
+    volumes:
+      - ../backend:/app
+    command:
+      - /bin/sh
+      - -c
+      - >-
+        exec watchmedo auto-restart
+        --directory=./app
+        --pattern=*.py
+        --recursive
+        --
+        celery -A app.workers.celery_app worker
+        --loglevel=info
+        --concurrency="$${DIARIZE_WORKER_CONCURRENCY:-2}"
+        --queues=diarize
+
+  worker-postprocess:
+    volumes:
+      - ../backend:/app
+    command:
+      - /bin/sh
+      - -c
+      - >-
+        exec watchmedo auto-restart
+        --directory=./app
+        --pattern=*.py
+        --recursive
+        --
+        celery -A app.workers.celery_app worker
+        --loglevel=info
+        --concurrency="$${POSTPROCESS_WORKER_CONCURRENCY:-6}"
+        --queues=postprocess
+
+  worker-minutes:
+    volumes:
+      - ../backend:/app
+    command:
+      - /bin/sh
+      - -c
+      - >-
+        exec watchmedo auto-restart
+        --directory=./app
+        --pattern=*.py
+        --recursive
+        --
+        celery -A app.workers.celery_app worker
+        --loglevel=info
+        --concurrency="$${MINUTES_WORKER_CONCURRENCY:-10}"
+        --queues=minutes

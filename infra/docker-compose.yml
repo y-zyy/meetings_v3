@@ -1,0 +1,168 @@
+version: "3.9"
+
+x-api-env: &api-env
+  env_file: ../.env
+
+x-worker-common: &worker-common
+  build:
+    context: ../backend
+    dockerfile: Dockerfile
+  restart: unless-stopped
+  <<: *api-env
+  depends_on:
+    postgres:
+      condition: service_healthy
+    redis:
+      condition: service_healthy
+  volumes:
+    - ../data/uploads:/app/data/uploads
+    - ../backend/data/correction_rules_seed.json:/app/data/correction_rules_seed.json:ro
+  networks:
+    - internal
+
+services:
+
+  # ── PostgreSQL ─────────────────────────────────────────────────────────────
+  postgres:
+    image: postgres:17-alpine
+    restart: unless-stopped
+    # API(uvicorn 4 x 풀 15) + 워커 프로세스(약 22 x 3) 를 수용하도록 기본 100 에서 상향
+    command: ["postgres", "-c", "max_connections=200"]
+    environment:
+      POSTGRES_DB: meetings
+      POSTGRES_USER: meetings
+      POSTGRES_PASSWORD: meetings
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U meetings"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+    networks:
+      - internal
+
+  # ── Redis ─────────────────────────────────────────────────────────────────
+  redis:
+    image: redis:7-alpine
+    restart: unless-stopped
+    command: redis-server --save 60 1 --loglevel warning
+    volumes:
+      - redis_data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+    networks:
+      - internal
+
+  # ── FastAPI ───────────────────────────────────────────────────────────────
+  api:
+    build:
+      context: ../backend
+      dockerfile: Dockerfile
+    restart: unless-stopped
+    <<: *api-env
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    volumes:
+      - ../data/uploads:/app/data/uploads   # 호스트 경로에 직접 저장
+    networks:
+      - internal
+    healthcheck:
+      test: ["CMD-SHELL", "python -c \"import urllib.request; urllib.request.urlopen('http://localhost:8000/api/health')\" || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+
+  # ── Celery workers (stage-isolated queues) ────────────────────────────────
+  # GPU 단계(asr, diarize) 워커 동시성은 "GPU 슬롯 수(WhisperX 서버 수 x WHISPERX_MAX_CONCURRENCY)
+  # + 1(업로드/디코딩 파이프라이닝)" 정도로 맞춘다. 그보다 크게 잡으면 대기열이 Redis 가 아니라
+  # HTTP 요청 안(WhisperX 세마포어)에 쌓여, 대기 시간이 ASR_TIMEOUT / Celery time limit 에 포함되고
+  # 타임아웃 → 재시도 시 같은 오디오를 GPU 가 중복 처리하게 된다.
+  # LLM 단계 동시 요청 수 ≈ POSTPROCESS_WORKER_CONCURRENCY x LLM_POSTPROCESS_PARALLELISM
+  #                       + MINUTES_WORKER_CONCURRENCY  (LLM 서버 max_num_seqs 이하로 유지)
+  worker-ingest:
+    <<: *worker-common
+    command:
+      - /bin/sh
+      - -c
+      - >-
+        exec celery -A app.workers.celery_app worker
+        --loglevel=info
+        --concurrency="$${INGEST_WORKER_CONCURRENCY:-4}"
+        --queues=ingest
+
+  worker-asr:
+    <<: *worker-common
+    command:
+      - /bin/sh
+      - -c
+      - >-
+        exec celery -A app.workers.celery_app worker
+        --loglevel=info
+        --concurrency="$${ASR_WORKER_CONCURRENCY:-2}"
+        --queues=asr
+
+  worker-diarize:
+    <<: *worker-common
+    command:
+      - /bin/sh
+      - -c
+      - >-
+        exec celery -A app.workers.celery_app worker
+        --loglevel=info
+        --concurrency="$${DIARIZE_WORKER_CONCURRENCY:-2}"
+        --queues=diarize
+
+  worker-postprocess:
+    <<: *worker-common
+    command:
+      - /bin/sh
+      - -c
+      - >-
+        exec celery -A app.workers.celery_app worker
+        --loglevel=info
+        --concurrency="$${POSTPROCESS_WORKER_CONCURRENCY:-6}"
+        --queues=postprocess
+
+  worker-minutes:
+    <<: *worker-common
+    command:
+      - /bin/sh
+      - -c
+      - >-
+        exec celery -A app.workers.celery_app worker
+        --loglevel=info
+        --concurrency="$${MINUTES_WORKER_CONCURRENCY:-10}"
+        --queues=minutes
+
+  # ── Nginx ─────────────────────────────────────────────────────────────────
+  nginx:
+    image: nginx:alpine
+    restart: unless-stopped
+    ports:
+      - "0.0.0.0:8080:80"   # HTTP -> HTTPS 리다이렉트
+      - "0.0.0.0:8443:443"  # HTTPS (자체 서명 인증서, infra/nginx/gen-selfsigned-cert.sh 로 생성)
+    depends_on:
+      api:
+        condition: service_healthy
+    volumes:
+      - ./nginx/nginx.conf:/etc/nginx/nginx.conf:ro
+      - ./nginx/certs:/etc/nginx/certs:ro
+      - ../service/frontend:/usr/share/nginx/html:ro  # login-bg.jpg 파일을 이 폴더에 넣으면 로그인 배경 이미지로 적용됨
+    networks:
+      - internal
+
+volumes:
+  postgres_data:
+  redis_data:
+  # uploads 볼륨은 bind mount로 대체되어 제거됨
+
+networks:
+  internal:
+    driver: bridge

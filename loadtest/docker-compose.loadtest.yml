@@ -1,0 +1,51 @@
+# GPU/LLM 없이 실제 배포 스택(api, celery, postgres, redis, nginx)의 파이프라인을 부하 테스트할 때 사용.
+# WhisperX/LLM 자리에 목 서버를 붙인다. (실제 GPU 서버로 테스트할 때는 이 파일을 쓰지 않는다)
+#
+#   cd infra
+#   docker compose -f docker-compose.yml -f ../loadtest/docker-compose.loadtest.yml up -d --build
+#
+# 목 서버 처리 속도는 아래 environment 로 조정 (MOCK_TIME_SCALE=0.01 이면 100배 빠르게 진행)
+
+x-mock-env: &mock-env
+  MOCK_TIME_SCALE: "${MOCK_TIME_SCALE:-1.0}"
+
+x-backend-mock-env: &backend-mock-env
+  ASR_API_URL: http://mock-asr:9000/transcribe
+  LLM_API_BASE_URL: http://mock-llm:8001/v1
+  LLM_MODEL: mock
+
+services:
+  mock-asr:
+    build: &mock-build
+      context: ../loadtest
+      dockerfile: Dockerfile.mock
+    command: uvicorn mock_asr_server:app --host 0.0.0.0 --port 9000 --log-level warning
+    environment:
+      <<: *mock-env
+      MOCK_GPU_SLOTS: "${MOCK_GPU_SLOTS:-1}"
+      MOCK_RTF_TRANSCRIBE: "${MOCK_RTF_TRANSCRIBE:-0.03}"
+      MOCK_RTF_DIARIZE: "${MOCK_RTF_DIARIZE:-0.03}"
+      MOCK_PRIORITY: "${MOCK_PRIORITY:-true}"
+    networks: [internal]
+
+  mock-llm:
+    build: *mock-build
+    command: uvicorn mock_llm_server:app --host 0.0.0.0 --port 8001 --log-level warning
+    environment:
+      <<: *mock-env
+      MOCK_LLM_MAX_SEQS: "${MOCK_LLM_MAX_SEQS:-32}"
+      MOCK_LLM_DECODE_TPS: "${MOCK_LLM_DECODE_TPS:-40}"
+    networks: [internal]
+
+  api:
+    environment: *backend-mock-env
+  worker-ingest:
+    environment: *backend-mock-env
+  worker-asr:
+    environment: *backend-mock-env
+  worker-diarize:
+    environment: *backend-mock-env
+  worker-postprocess:
+    environment: *backend-mock-env
+  worker-minutes:
+    environment: *backend-mock-env
